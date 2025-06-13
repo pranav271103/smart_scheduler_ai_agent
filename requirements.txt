@@ -1,0 +1,12 @@
+pyttsx3>=2.90
+SpeechRecognition>=3.8.1
+requests
+python-dotenv
+google-auth-oauthlib>=0.4.6
+google-auth-httplib2>=0.1.0
+google-api-python-client>=2.0.0
+dateparser>=1.1.0
+python-dateutil>=2.8.2
+pytz>=2021.3
+google-generativeai>=0.3.0
+googletrans>=3.1.0a0
