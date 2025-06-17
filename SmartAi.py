@@ -1,22 +1,21 @@
-import pyttsx3
-import speech_recognition as sr
+import os
+import re
+import json
+import pytz
+import sys
+import pickle
 import datetime
+from datetime import timedelta
+import dateparser
+from dateutil import parser
+import speech_recognition as sr
+import pyttsx3
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from google.auth.transport.requests import Request
-import dateparser
-from dateutil import parser
-from datetime import timedelta
-import pytz
-import os
-import re
-import sys
-import json
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
-from googletrans import Translator
-import pickle
 
 class SmartScheduler:
     def __init__(self):
@@ -24,32 +23,30 @@ class SmartScheduler:
         self.output_mode = None
         self.creds = None
         self.calendar_service = None
-        self.meeting_details = {
+        self.conversation_history = []
+        self.meeting_context = {
+            'purpose': None,
             'duration': None,
-            'time': None,
-            'day': None,
-            'title': None,
+            'time_preference': None,
+            'day_preference': None,
             'attendees': [],
-            'reminders': [],
-            'language': 'en'
+            'constraints': []
         }
         self.user_preferences = self.load_user_preferences()
         self.engine = None
         self.recognizer = None
         self.llm = self.initialize_gemini()
-        self.translator = Translator()
-        self._current_conversation_context = []
+        self.timezone = 'Asia/Kolkata'
         
         try:
             self.authenticate_calendar()
         except Exception as e:
             print(f"Authentication failed: {str(e)}")
-            print("Please check your credentials and try again.")
             sys.exit(1)
 
     def initialize_gemini(self):
-        genai.configure(api_key='YOUR API KEY')  # API KEY - Put Yours Here
-        return genai.GenerativeModel('gemini-1.5-flash-latest') # let the model be the same as gemini-1.5-flash-latest because it supports this model as per latest rate limits.
+        genai.configure(api_key='AIzaSyCSbCZ1wem49jxmQAJZYVTzk6rHBDlIqgs')
+        return genai.GenerativeModel('gemini-1.5-flash-latest')
 
     def load_user_preferences(self):
         try:
@@ -61,238 +58,18 @@ class SmartScheduler:
         return {
             'usual_meeting_times': {},
             'preferred_language': 'en',
-            'default_reminders': ['email', 10]
+            'default_reminders': ['email', 10],
+            'favorite_times': ['10:00', '14:00', '15:30']
         }
-
-    def save_user_preferences(self):
-        try:
-            with open('user_preferences.pkl', 'wb') as f:
-                pickle.dump(self.user_preferences, f)
-        except Exception as e:
-            print(f"Error saving preferences: {e}")
-
-    def translate_text(self, text, dest_language=None):
-        if not dest_language:
-            dest_language = self.meeting_details['language']
-        try:
-            translated = self.translator.translate(text, dest=dest_language)
-            return translated.text
-        except Exception as e:
-            print(f"Translation error: {e}")
-            return text
-
-    def generate_conversational_response(self, user_input, context=None):
-        safety_settings = {
-            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE
-        }
-        
-        conversation_history = "\n".join([f"User: {msg['input']}\nAssistant: {msg['response']}" 
-                                       for msg in self._current_conversation_context[-3:]])
-        
-        prompt = f"""You are SmartScheduler, a multilingual AI assistant for scheduling meetings.
-Current language: {self.meeting_details['language']}
-User preferences: {json.dumps(self.user_preferences, indent=2)}
-
-Conversation history:
-{conversation_history}
-
-Current meeting details:
-- Duration: {self.meeting_details['duration'] or "Not specified"}
-- Time: {self.meeting_details['time'] or "Not specified"}
-- Day: {self.meeting_details['day'] or "Not specified"}
-- Title: {self.meeting_details['title'] or "Not specified"}
-- Attendees: {', '.join(self.meeting_details['attendees']) if self.meeting_details['attendees'] else "None"}
-- Reminders: {', '.join(str(r) for r in self.meeting_details['reminders']) if self.meeting_details['reminders'] else "None"}
-
-{context or ''}
-
-User: {user_input}
-
-Respond conversationally and help complete the scheduling process. Ask relevant follow-up questions.
-If suggesting times, consider the user's usual meeting times with these attendees."""
-        
-        try:
-            response = self.llm.generate_content(
-                prompt,
-                safety_settings=safety_settings
-            )
-            return response.text
-        except Exception as e:
-            print(f"LLM error: {e}")
-            return "I encountered an error. Let's try again."
-
-    def check_for_conflicts(self):
-        start_time = self.parse_time(f"{self.meeting_details['day']} {self.meeting_details['time']}")
-        if not start_time:
-            return None
-        
-        end_time = start_time + timedelta(minutes=self.meeting_details['duration'])
-        
-        try:
-            events_result = self.calendar_service.events().list(
-                calendarId='primary',
-                timeMin=start_time.isoformat(),
-                timeMax=end_time.isoformat(),
-                singleEvents=True,
-                orderBy='startTime'
-            ).execute()
-            
-            return events_result.get('items', [])
-        except Exception as e:
-            print(f"Error checking conflicts: {str(e)}")
-            return None
-
-    def suggest_usual_times(self, attendees):
-        usual_times = {}
-        for attendee in attendees:
-            if attendee in self.user_preferences['usual_meeting_times']:
-                usual_times.update(self.user_preferences['usual_meeting_times'][attendee])
-        
-        if usual_times:
-            return max(usual_times.items(), key=lambda x: x[1])[0]
-        return None
-
-    def handle_conflict_resolution(self, conflicts):
-        conflict_details = "\n".join([f"- {event['summary']} ({event['start'].get('dateTime')})" 
-                                   for event in conflicts[:3]])
-        
-        response = self.generate_conversational_response(
-            "",
-            context=f"Found these conflicting events:\n{conflict_details}\nAsk user how to proceed"
-        )
-        self.output(response)
-        
-        user_choice = self.input()
-        if not user_choice:
-            return None
-        
-        if 'reschedule' in user_choice.lower():
-            return self.suggest_alternative_times()
-        elif 'prioritize' in user_choice.lower():
-            return 'force'
-        return None
-
-    def suggest_alternative_times(self):
-        available_slots = self.get_available_slots()
-        if not available_slots:
-            self.output("No available slots found. Please try another time.")
-            return None
-        
-        requested_time = self.parse_time(f"{self.meeting_details['day']} {self.meeting_details['time']}")
-        if not requested_time:
-            return None
-        
-        available_slots.sort(key=lambda x: abs((x['start'] - requested_time).total_seconds()))
-        
-        suggestions = []
-        for slot in available_slots[:3]:
-            suggestions.append(slot['start'].strftime("%A at %I:%M %p"))
-        
-        response = self.generate_conversational_response(
-            "",
-            context=f"Suggest these alternative times: {', '.join(suggestions)}"
-        )
-        self.output(response)
-        
-        user_choice = self.input()
-        if user_choice and any(str(i+1) in user_choice for i in range(len(suggestions))):
-            selected_idx = next((i for i in range(len(suggestions)) if str(i+1) in user_choice), 0)
-            selected_slot = available_slots[selected_idx]
-            self.meeting_details['time'] = selected_slot['start'].strftime("%H:%M")
-            self.meeting_details['day'] = selected_slot['start'].strftime("%A").lower()
-            return True
-        return False
-
-    def contextual_followups(self):
-        if len(self.meeting_details['attendees']) > 0:
-            response = self.generate_conversational_response(
-                "",
-                context="Ask if user wants to invite anyone else"
-            )
-            self.output(response)
-            
-            additional_attendees = self.input()
-            if additional_attendees and 'yes' in additional_attendees.lower():
-                self.output("Who else should I invite? (Enter email addresses separated by commas)")
-                new_attendees = self.input()
-                if new_attendees:
-                    self.meeting_details['attendees'].extend(
-                        [email.strip() for email in new_attendees.split(',')]
-                    )
-        
-        response = self.generate_conversational_response(
-            "",
-            context="Ask if user wants to set custom reminders"
-        )
-        self.output(response)
-        
-        reminder_choice = self.input()
-        if reminder_choice and 'yes' in reminder_choice.lower():
-            self.output("When should I remind you? (e.g., '10 minutes before' or '1 hour before')")
-            reminder_time = self.input()
-            if reminder_time:
-                self.meeting_details['reminders'].append(reminder_time)
-        
-        for attendee in self.meeting_details['attendees']:
-            if attendee not in self.user_preferences['usual_meeting_times']:
-                self.user_preferences['usual_meeting_times'][attendee] = {}
-            
-            meeting_time_key = f"{self.meeting_details['day']} {self.meeting_details['time']}"
-            self.user_preferences['usual_meeting_times'][attendee][meeting_time_key] = \
-                self.user_preferences['usual_meeting_times'][attendee].get(meeting_time_key, 0) + 1
-        
-        self.save_user_preferences()
-
-    def parse_meeting_details(self, user_input):
-        prompt = """Extract meeting details from this input and return ONLY valid JSON:
-{
-  "duration_minutes": number,
-  "day": "today|tomorrow|Monday|etc",
-  "time": "HH:MM",
-  "title": "string",
-  "attendees": ["email1", "email2"]
-}
-
-Input: """ + user_input
-        
-        try:
-            response = self.llm.generate_content(
-                prompt,
-                generation_config={"response_mime_type": "application/json"}
-            )
-            if response.text:
-                return json.loads(response.text)
-            return None
-        except Exception as e:
-            print(f"LLM parsing error: {e}")
-            return None
-
-    def initialize_speech_engine(self):
-        try:
-            self.engine = pyttsx3.init('sapi5')
-            voices = self.engine.getProperty('voices')
-            self.engine.setProperty('voice', voices[1].id) # 0 - male and 1 - female
-            self.engine.setProperty('rate', 150)
-            self.recognizer = sr.Recognizer()
-        except Exception as e:
-            print(f"Failed to initialize speech engine: {str(e)}")
-            self.output_mode = 'text'
 
     def authenticate_calendar(self):
+        SCOPES = ['https://www.googleapis.com/auth/calendar']
         if os.path.exists('token.json'):
             self.creds = Credentials.from_authorized_user_file('token.json', SCOPES)
         
         if not self.creds or not self.creds.valid:
             if self.creds and self.creds.expired and self.creds.refresh_token:
-                try:
-                    self.creds.refresh(Request())
-                except Exception as e:
-                    print(f"Refresh failed: {str(e)}")
-                    flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
-                    self.creds = flow.run_local_server(port=0)
+                self.creds.refresh(Request())
             else:
                 flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
                 self.creds = flow.run_local_server(port=0)
@@ -300,11 +77,18 @@ Input: """ + user_input
             with open('token.json', 'w') as token:
                 token.write(self.creds.to_json())
         
+        self.calendar_service = build('calendar', 'v3', credentials=self.creds)
+
+    def initialize_speech_engine(self):
         try:
-            self.calendar_service = build('calendar', 'v3', credentials=self.creds)
+            self.engine = pyttsx3.init('sapi5')
+            voices = self.engine.getProperty('voices')
+            self.engine.setProperty('voice', voices[1].id)
+            self.engine.setProperty('rate', 150)
+            self.recognizer = sr.Recognizer()
         except Exception as e:
-            print(f"Failed to build calendar service: {str(e)}")
-            raise
+            print(f"Failed to initialize speech engine: {str(e)}")
+            self.output_mode = 'text'
 
     def output(self, message):
         print(f"Assistant: {message}")
@@ -378,32 +162,77 @@ Input: """ + user_input
                 break
             else:
                 print("Invalid choice. Please enter 1, 2, 3, or 4.")
-        
-        self.output("\nGreat! I'm ready to help you schedule your meetings.")
 
-    def parse_time(self, time_str):
+    def parse_time(self, time_str, reference_date=None):
+        """Enhanced time parsing with Asia/Kolkata timezone"""
         try:
-            parsed_time = dateparser.parse(
-                time_str,
-                settings={
-                    'PREFER_DATES_FROM': 'future',
-                    'RELATIVE_BASE': datetime.datetime.now(pytz.timezone(TIMEZONE)),
-                    'TIMEZONE': TIMEZONE
-                }
-            )
+            settings = {
+                'PREFER_DATES_FROM': 'future',
+                'RELATIVE_BASE': datetime.datetime.now(pytz.timezone(self.timezone)),
+                'TIMEZONE': self.timezone,
+                'RETURN_AS_TIMEZONE_AWARE': True
+            }
+            
+            if reference_date:
+                settings['RELATIVE_BASE'] = reference_date
+            
+            parsed_time = dateparser.parse(time_str, settings=settings)
+            
             if parsed_time:
-                return parsed_time.astimezone(pytz.timezone(TIMEZONE))
+                # Handle relative days (e.g., "next Tuesday")
+                if not any(word in time_str.lower() for word in ['today', 'tomorrow', 'yesterday']):
+                    if parsed_time.date() < datetime.datetime.now(pytz.timezone(self.timezone)).date():
+                        parsed_time += timedelta(days=7)
+                
+                return parsed_time.astimezone(pytz.timezone(self.timezone))
             return None
         except Exception as e:
             print(f"Time parsing error: {str(e)}")
             return None
 
-    def get_available_slots(self):
-        day = self.parse_time(self.meeting_details.get('day', 'today')) or datetime.datetime.now(pytz.timezone(TIMEZONE))
-        start_of_day = day.replace(hour=9, minute=0, second=0, microsecond=0)
-        end_of_day = day.replace(hour=17, minute=0, second=0, microsecond=0)
+    def resolve_relative_time(self, time_phrase):
+        """Handle complex relative time references using LLM"""
+        prompt = f"""Interpret this time reference and return only the specific date/time in ISO format:
+Current date: {datetime.datetime.now(pytz.timezone(self.timezone)).strftime('%Y-%m-%d')}
+Time zone: {self.timezone}
+
+Time reference: "{time_phrase}"
+
+Consider:
+1. Relative dates ("next Tuesday")
+2. Event-based references ("after my 2pm meeting")
+3. Calendar logic ("last weekday of this month")
+4. Time buffers ("1 hour before my flight")
+
+Return ONLY the resolved date/time in ISO format or "unknown" if unclear."""
         
         try:
+            response = self.llm.generate_content(prompt)
+            if response.text.lower() != "unknown":
+                return parser.parse(response.text).astimezone(pytz.timezone(self.timezone))
+        except Exception as e:
+            print(f"LLM time resolution error: {e}")
+        return None
+
+    def get_available_slots(self, day, duration_minutes=30, time_range=None):
+        """Get available slots for a specific day with Asia/Kolkata working hours"""
+        try:
+            if isinstance(day, str):
+                day = self.resolve_relative_time(day) or self.parse_time(day)
+            
+            if not day:
+                return None
+                
+            # Standard working hours in India (9AM to 6PM)
+            start_of_day = day.replace(hour=9, minute=0, second=0, microsecond=0)
+            end_of_day = day.replace(hour=18, minute=0, second=0, microsecond=0)
+            
+            # Adjust for specific time ranges
+            if time_range:
+                start_hour, end_hour = time_range
+                start_of_day = start_of_day.replace(hour=start_hour)
+                end_of_day = end_of_day.replace(hour=end_hour)
+            
             events_result = self.calendar_service.events().list(
                 calendarId='primary',
                 timeMin=start_of_day.isoformat(),
@@ -419,19 +248,16 @@ Input: """ + user_input
             while current_time < end_of_day:
                 all_slots.append({
                     'start': current_time,
-                    'end': current_time + timedelta(minutes=30)
+                    'end': current_time + timedelta(minutes=duration_minutes)
                 })
-                current_time += timedelta(minutes=30)
+                current_time += timedelta(minutes=15)  # Check every 15 minutes
             
             available_slots = []
             for slot in all_slots:
                 conflict = False
                 for event in events:
-                    event_start_str = event['start'].get('dateTime', event['start'].get('date'))
-                    event_end_str = event['end'].get('dateTime', event['end'].get('date'))
-                    
-                    event_start = parser.parse(event_start_str).astimezone(pytz.timezone(TIMEZONE))
-                    event_end = parser.parse(event_end_str).astimezone(pytz.timezone(TIMEZONE))
+                    event_start = parser.parse(event['start'].get('dateTime', event['start'].get('date'))).astimezone(pytz.timezone(self.timezone))
+                    event_end = parser.parse(event['end'].get('dateTime', event['end'].get('date'))).astimezone(pytz.timezone(self.timezone))
                     
                     if not (slot['end'] <= event_start or slot['start'] >= event_end):
                         conflict = True
@@ -445,224 +271,185 @@ Input: """ + user_input
             print(f"Error getting available slots: {str(e)}")
             return None
 
-    def schedule_meeting(self):
-        if not all([self.meeting_details['duration'], self.meeting_details['time'], self.meeting_details['day']]):
-            return None
+    def create_calendar_event(self, title, start_time, end_time, attendees=None):
+        """Actually create the calendar event with Google Meet"""
+        if not attendees:
+            attendees = []
         
-        requested_time = self.parse_time(f"{self.meeting_details['day']} {self.meeting_details['time']}")
-        if not requested_time:
-            return None
-        
-        available_slots = self.get_available_slots()
-        if not available_slots:
-            return None
-        
-        best_slot = None
-        min_diff = float('inf')
-        for slot in available_slots:
-            time_diff = abs((slot['start'] - requested_time).total_seconds())
-            if time_diff < min_diff:
-                min_diff = time_diff
-                best_slot = slot
-        
-        if best_slot:
-            start_time = best_slot['start']
-            end_time = start_time + timedelta(minutes=self.meeting_details['duration'])
-            
-            event = {
-                'summary': self.meeting_details['title'] or 'Meeting',
-                'description': 'Scheduled by Smart Scheduler',
-                'start': {
-                    'dateTime': start_time.isoformat(),
-                    'timeZone': TIMEZONE,
-                },
-                'end': {
-                    'dateTime': end_time.isoformat(),
-                    'timeZone': TIMEZONE,
-                },
-                'attendees': [{'email': a} for a in self.meeting_details['attendees']],
-                'reminders': {
-                    'useDefault': True,
-                },
-                'conferenceData': {
-                    'createRequest': {
-                        'requestId': f"meet_{start_time.timestamp()}",
-                        'conferenceSolutionKey': {
-                            'type': 'hangoutsMeet'
-                        }
-                    }
+        event = {
+            'summary': title,
+            'start': {
+                'dateTime': start_time.isoformat(),
+                'timeZone': self.timezone,
+            },
+            'end': {
+                'dateTime': end_time.isoformat(),
+                'timeZone': self.timezone,
+            },
+            'attendees': [{'email': email} for email in attendees],
+            'conferenceData': {
+                'createRequest': {
+                    'requestId': f"{title.replace(' ', '')}_{start_time.timestamp()}",
+                    'conferenceSolutionKey': {'type': 'hangoutsMeet'}
                 }
-            }
-            
-            try:
-                event = self.calendar_service.events().insert(
-                    calendarId='primary',
-                    body=event,
-                    conferenceDataVersion=1
-                ).execute()
-                
-                return event
-            except Exception as e:
-                print(f"Error scheduling meeting: {str(e)}")
-                return None
-        return None
-
-    def process_conversation(self, user_input):
-        if not user_input:
+            },
+            'reminders': {
+                'useDefault': False,
+                'overrides': [
+                    {'method': 'email', 'minutes': 24 * 60},
+                    {'method': 'popup', 'minutes': 30},
+                ],
+            },
+        }
+        
+        try:
+            event = self.calendar_service.events().insert(
+                calendarId='primary',
+                body=event,
+                conferenceDataVersion=1
+            ).execute()
+            return event
+        except Exception as e:
+            print(f"Error creating event: {e}")
             return None
+
+    def extract_meeting_details(self, user_input):
+        """Use LLM to extract structured meeting details"""
+        prompt = f"""Extract meeting details from this request in JSON format:
+{user_input}
+
+Include:
+- title (string)
+- duration (minutes)
+- day (e.g., "Tuesday")
+- date (specific date if mentioned)
+- time_range (e.g., "9-12")
+- attendees (list of emails)
+- purpose (string)
+
+Return ONLY valid JSON with these fields."""
         
-        self._current_conversation_context.append({
-            'input': user_input,
-            'response': None,
-            'timestamp': datetime.datetime.now().isoformat()
-        })
+        try:
+            response = self.llm.generate_content(prompt)
+            return json.loads(response.text)
+        except Exception as e:
+            print(f"Error extracting meeting details: {e}")
+            return {}
+
+    def handle_scheduling(self, user_input):
+        """Handle the complete scheduling workflow"""
+        # Extract meeting details using LLM
+        meeting_details = self.extract_meeting_details(user_input)
         
-        if any(word in user_input.lower() for word in ['switch to', 'in', 'language']):
-            lang_match = re.search(r'(english|spanish|french|german|hindi|chinese)', user_input.lower())
-            if lang_match:
-                lang_code = {'english': 'en', 'spanish': 'es', 'french': 'fr', 
-                           'german': 'de', 'hindi': 'hi', 'chinese': 'zh-cn'}.get(lang_match.group(1), 'en')
-                self.meeting_details['language'] = lang_code
-                self.output(f"Switched to {lang_match.group(1)}")
-                return
+        # Calculate next Tuesday if requested
+        if 'next tuesday' in user_input.lower():
+            today = datetime.datetime.now(pytz.timezone(self.timezone))
+            days_ahead = (1 - today.weekday()) % 7  # Tuesday is weekday 1
+            if days_ahead <= 0:  # If today is Tuesday, get next week's Tuesday
+                days_ahead += 7
+            next_tuesday = today + datetime.timedelta(days_ahead)
+            meeting_details['day'] = next_tuesday.strftime('%A')
+            meeting_details['date'] = next_tuesday.date().isoformat()
         
-        parsed_details = self.parse_meeting_details(user_input)
-        if parsed_details:
-            if parsed_details.get('duration_minutes'):
-                self.meeting_details['duration'] = parsed_details['duration_minutes']
-            if parsed_details.get('day'):
-                self.meeting_details['day'] = parsed_details['day']
-            if parsed_details.get('time'):
-                self.meeting_details['time'] = parsed_details['time']
-            if parsed_details.get('title'):
-                self.meeting_details['title'] = parsed_details['title']
-            if parsed_details.get('attendees'):
-                self.meeting_details['attendees'] = parsed_details['attendees']
+        # Set default duration if not specified
+        if not meeting_details.get('duration'):
+            meeting_details['duration'] = 30  # Default to 30 minutes
         
-        required_fields = ['duration', 'time', 'day']
-        missing_fields = [field for field in required_fields if not self.meeting_details.get(field)]
-        
-        if not missing_fields:
-            usual_time = self.suggest_usual_times(self.meeting_details['attendees'])
-            if usual_time:
-                response = self.generate_conversational_response(
-                    user_input,
-                    context=f"Suggest usual meeting time: {usual_time}"
+        # Find available time slot
+        if meeting_details.get('day'):
+            slots = self.get_available_slots(
+                meeting_details['day'],
+                meeting_details['duration'],
+                self.parse_time_range(meeting_details.get('time_range'))
+            )
+            
+            if slots:
+                chosen_slot = slots[0]
+                # Actually create the event
+                event = self.create_calendar_event(
+                    meeting_details.get('title', 'Meeting'),
+                    chosen_slot['start'],
+                    chosen_slot['end'],
+                    meeting_details.get('attendees', [])
                 )
-                self.output(response)
                 
-                use_usual_time = self.input()
-                if use_usual_time and 'yes' in use_usual_time.lower():
-                    time_day = self.extract_time_day(usual_time)
-                    if time_day:
-                        self.meeting_details.update(time_day)
-            
-            conflicts = self.check_for_conflicts()
-            if conflicts:
-                resolution = self.handle_conflict_resolution(conflicts)
-                if resolution == 'force':
-                    pass
-                elif resolution is None:
-                    return
-                elif resolution is True:
-                    pass
-            
-            confirmation = self.generate_conversational_response(
-                user_input,
-                context="All meeting details are complete. Ask user to confirm before scheduling."
-            )
-            self.output(confirmation)
-            
-            response = self.input()
-            if response and ('yes' in response.lower() or 'confirm' in response.lower()):
-                event = self.schedule_meeting()
                 if event:
-                    meet_link = event.get('hangoutLink', '')
-                    if meet_link:
-                        self.output(f"Meeting scheduled successfully! Here's your Google Meet link: {meet_link}")
-                    else:
-                        self.output("Meeting scheduled successfully!")
-                    
-                    self.contextual_followups()
-                    
-                    self.meeting_details = {
-                        'duration': None,
-                        'time': None,
-                        'day': None,
-                        'title': None,
-                        'attendees': [],
-                        'reminders': [],
-                        'language': self.meeting_details['language']
-                    }
-                else:
-                    self.output("I couldn't schedule the meeting. Please try again.")
-            elif response and ('no' in response.lower() or 'cancel' in response.lower()):
-                self.output("Okay, I won't schedule the meeting.")
-                self.meeting_details = {
-                    'duration': None,
-                    'time': None,
-                    'day': None,
-                    'title': None,
-                    'attendees': [],
-                    'reminders': [],
-                    'language': self.meeting_details['language']
-                }
-            else:
-                return self.process_conversation(response)
-        else:
-            response = self.generate_conversational_response(
-                user_input,
-                context=f"Still need information about: {', '.join(missing_fields)}"
-            )
-            self.output(response)
+                    meeting_link = event.get('hangoutLink', 'Google Meet link generated')
+                    return (f"I've scheduled '{meeting_details.get('title', 'Meeting')}' "
+                           f"on {chosen_slot['start'].strftime('%A, %B %d at %I:%M %p')} "
+                           f"for {meeting_details['duration']} minutes. "
+                           f"Here's your Google Meet link: {meeting_link}")
         
-        if self._current_conversation_context:
-            self._current_conversation_context[-1]['response'] = response
+        return "I couldn't schedule the meeting. Please try again with more specific details."
 
-    def extract_time_day(self, command):
-        day_match = re.search(r'(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)', command, re.IGNORECASE)
-        day = day_match.group(1) if day_match else None
+    def parse_time_range(self, time_range_str):
+        """Convert time range string to (start_hour, end_hour)"""
+        if not time_range_str:
+            return None
         
-        time_match = re.search(r'(\d{1,2})(?::(\d{2}))?\s*(am|pm)?', command, re.IGNORECASE)
-        if time_match:
-            hour = int(time_match.group(1))
-            minute = int(time_match.group(2)) if time_match.group(2) else 0
-            meridian = time_match.group(3).lower() if time_match.group(3) else None
-            
-            if meridian:
-                if meridian == 'pm' and hour < 12:
-                    hour += 12
-                elif meridian == 'am' and hour == 12:
-                    hour = 0
-            time_str = f"{hour:02d}:{minute:02d}"
-            return {'day': day, 'time': time_str}
-        return None
+        try:
+            start, end = map(int, time_range_str.split('-'))
+            return (start, end)
+        except:
+            return None
 
-    def run(self):
-        self.select_interaction_mode()
+    def generate_response(self, user_input):
+        """Enhanced LLM response generation with smart scheduling logic"""
+        # Handle date/time queries directly
+        if 'today' in user_input.lower():
+            today = datetime.datetime.now(pytz.timezone(self.timezone))
+            return f"Today is {today.strftime('%A, %B %d, %Y')} and the current time is {today.strftime('%I:%M %p')} IST."
         
-        self.output("""
-Hello! I'm your Smart Scheduler assistant By Pranav. 
-I can help you schedule meetings with Google Meet links. 
-You can say things like:
-- "Schedule a 30 minute meeting with john@example.com tomorrow at 2pm"
-- "Set up a 1 hour team meeting called 'Project Update' on Friday"
-- "I need to meet with Sarah for 45 minutes today"
+        if 'time now' in user_input.lower():
+            now = datetime.datetime.now(pytz.timezone(self.timezone))
+            return f"The current time is {now.strftime('%I:%M %p')} IST."
+        
+        # Handle scheduling requests
+        if any(word in user_input.lower() for word in ['schedule', 'meeting', 'appointment']):
+            return self.handle_scheduling(user_input)
+        
+        # Default LLM response
+        prompt = f"""You are an advanced scheduling assistant in {self.timezone} timezone. Current context:
+{json.dumps(self.meeting_context, indent=2)}
 
-What would you like to schedule?
-""")
+Conversation history:
+{self.conversation_history[-5:] if self.conversation_history else 'None'}
+
+User input: "{user_input}"
+
+Generate a concise, helpful response that:
+1. Answers time/date queries accurately
+2. Handles scheduling requests efficiently
+3. Provides Google Meet links when appropriate
+4. Uses natural, friendly language"""
+        
+        try:
+            response = self.llm.generate_content(prompt)
+            return response.text
+        except Exception as e:
+            print(f"LLM error: {e}")
+            return "I encountered an error. Let's try again."
+
+    def process_conversation(self):
+        self.output("Hello! I'm your Smart Scheduling Assistant. How can I help you schedule today?")
         
         while True:
             user_input = self.input()
-            if self.process_conversation(user_input) == 'exit':
+            if not user_input:
+                continue
+            
+            if user_input.lower() in ['exit', 'quit', 'bye']:
+                self.output("Goodbye! Have a great day.")
                 break
+            
+            self.conversation_history.append(f"User: {user_input}")
+            response = self.generate_response(user_input)
+            self.output(response)
+            self.conversation_history.append(f"Assistant: {response}")
 
-# Constants
-SCOPES = [
-    'https://www.googleapis.com/auth/calendar.events',
-    'https://www.googleapis.com/auth/calendar'
-]
-TIMEZONE = 'Asia/Kolkata'  # Change to your timezone
+    def run(self):
+        self.select_interaction_mode()
+        self.process_conversation()
 
 if __name__ == "__main__":
     scheduler = SmartScheduler()
