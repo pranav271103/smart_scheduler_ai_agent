@@ -45,7 +45,7 @@ class SmartScheduler:
             sys.exit(1)
 
     def initialize_gemini(self):
-        genai.configure(api_key='AIzaSyCSbCZ1wem49jxmQAJZYVTzk6rHBDlIqgs')
+        genai.configure(api_key='YOUR API')
         return genai.GenerativeModel('gemini-1.5-flash-latest')
 
     def load_user_preferences(self):
